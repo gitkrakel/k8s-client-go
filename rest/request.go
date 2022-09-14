@@ -48,16 +48,6 @@ import (
 	"k8s.io/klog/v2"
 )
 
-var (
-	// longThrottleLatency defines threshold for logging requests. All requests being
-	// throttled (via the provided rateLimiter) for more than longThrottleLatency will
-	// be logged.
-	longThrottleLatency = 50 * time.Millisecond
-
-	// extraLongThrottleLatency defines the threshold for logging requests at log level 2.
-	extraLongThrottleLatency = 1 * time.Second
-)
-
 // HTTPClient is an interface for testing a request object.
 type HTTPClient interface {
 	Do(req *http.Request) (*http.Response, error)
@@ -225,12 +215,6 @@ func (r *Request) BackOff(manager BackoffManager) *Request {
 // If set to nil, this client will use the default warning handler (see SetDefaultWarningHandler).
 func (r *Request) WarningHandler(handler WarningHandler) *Request {
 	r.warningHandler = handler
-	return r
-}
-
-// Throttle receives a rate-limiter and sets or replaces an existing request limiter
-func (r *Request) Throttle(limiter flowcontrol.RateLimiter) *Request {
-	r.rateLimiter = limiter
 	return r
 }
 
@@ -577,42 +561,6 @@ func (r Request) finalURLTemplate() url.URL {
 	return *url
 }
 
-func (r *Request) tryThrottleWithInfo(ctx context.Context, retryInfo string) error {
-	if r.rateLimiter == nil {
-		return nil
-	}
-
-	now := time.Now()
-
-	err := r.rateLimiter.Wait(ctx)
-
-	latency := time.Since(now)
-
-	var message string
-	switch {
-	case len(retryInfo) > 0:
-		message = fmt.Sprintf("Waited for %v, %s - request: %s:%s", latency, retryInfo, r.verb, r.URL().String())
-	default:
-		message = fmt.Sprintf("Waited for %v due to client-side throttling, not priority and fairness, request: %s:%s", latency, r.verb, r.URL().String())
-	}
-
-	if latency > longThrottleLatency {
-		klog.V(3).Info(message)
-	}
-	if latency > extraLongThrottleLatency {
-		// If the rate limiter latency is very high, the log message should be printed at a higher log level,
-		// but we use a throttled logger to prevent spamming.
-		globalThrottledLogger.Infof(message)
-	}
-	metrics.RateLimiterLatency.Observe(ctx, r.verb, r.finalURLTemplate(), latency)
-
-	return err
-}
-
-func (r *Request) tryThrottle(ctx context.Context) error {
-	return r.tryThrottleWithInfo(ctx, "")
-}
-
 type throttleSettings struct {
 	logLevel       klog.Level
 	minLogInterval time.Duration
@@ -765,10 +713,6 @@ func (r *Request) Stream(ctx context.Context) (io.ReadCloser, error) {
 		return nil, r.err
 	}
 
-	if err := r.tryThrottle(ctx); err != nil {
-		return nil, err
-	}
-
 	url := r.URL().String()
 	req, err := http.NewRequest(r.verb, url, nil)
 	if err != nil {
@@ -867,13 +811,6 @@ func (r *Request) request(ctx context.Context, fn func(*http.Request, *http.Resp
 		client = http.DefaultClient
 	}
 
-	// Throttle the first try before setting up the timeout configured on the
-	// client. We don't want a throttled client to return timeouts to callers
-	// before it makes a single request.
-	if err := r.tryThrottle(ctx); err != nil {
-		return err
-	}
-
 	if r.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, r.timeout)
@@ -882,7 +819,6 @@ func (r *Request) request(ctx context.Context, fn func(*http.Request, *http.Resp
 
 	// Right now we make about ten retry attempts if we get a Retry-After response.
 	retries := 0
-	var retryInfo string
 	for {
 
 		url := r.URL().String()
@@ -894,15 +830,6 @@ func (r *Request) request(ctx context.Context, fn func(*http.Request, *http.Resp
 		req.Header = r.headers
 
 		r.backoff.Sleep(r.backoff.CalculateBackoff(r.URL()))
-		if retries > 0 {
-			// We are retrying the request that we already send to apiserver
-			// at least once before.
-			// This request should also be throttled with the client-internal rate limiter.
-			if err := r.tryThrottleWithInfo(ctx, retryInfo); err != nil {
-				return err
-			}
-			retryInfo = ""
-		}
 		resp, err := client.Do(req)
 		updateURLMetrics(ctx, r, resp, err)
 		if err != nil {
@@ -946,7 +873,6 @@ func (r *Request) request(ctx context.Context, fn func(*http.Request, *http.Resp
 
 			retries++
 			if seconds, wait := checkWait(resp); wait && retries <= r.maxRetries {
-				retryInfo = getRetryReason(retries, seconds, resp, err)
 				if seeker, ok := r.body.(io.Seeker); ok && r.body != nil {
 					_, err := seeker.Seek(0, 0)
 					if err != nil {
@@ -1218,26 +1144,6 @@ func retryAfterSeconds(resp *http.Response) (int, bool) {
 		}
 	}
 	return 0, false
-}
-
-func getRetryReason(retries, seconds int, resp *http.Response, err error) string {
-	// priority and fairness sets the UID of the FlowSchema associated with a request
-	// in the following response Header.
-	const responseHeaderMatchedFlowSchemaUID = "X-Kubernetes-PF-FlowSchema-UID"
-
-	message := fmt.Sprintf("retries: %d, retry-after: %ds", retries, seconds)
-
-	switch {
-	case resp.StatusCode == http.StatusTooManyRequests:
-		// it is server-side throttling from priority and fairness
-		flowSchemaUID := resp.Header.Get(responseHeaderMatchedFlowSchemaUID)
-		return fmt.Sprintf("%s - retry-reason: due to server-side throttling, FlowSchema UID: %q", message, flowSchemaUID)
-	case err != nil:
-		// it's a retriable error
-		return fmt.Sprintf("%s - retry-reason: due to retriable error, error: %v", message, err)
-	default:
-		return fmt.Sprintf("%s - retry-reason: %d", message, resp.StatusCode)
-	}
 }
 
 // Result contains the result of calling Request.Do().
